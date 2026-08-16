@@ -214,6 +214,11 @@
   .chip.on{background:var(--chalk);border-color:var(--chalk);color:var(--ink);font-weight:500}
   .preview{margin-top:12px;padding:11px 13px;background:var(--ink);border-radius:11px;font-family:var(--mono);font-size:11.5px;color:var(--muted);line-height:1.7}
   .preview b{color:var(--chalk);font-weight:500}
+  .diag{margin-top:10px;padding:11px 13px;border-radius:11px;background:var(--ink);border:1px solid var(--line-soft);font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--muted);display:none;white-space:pre-wrap;word-break:break-word}
+  .diag.on{display:block}
+  .diag b{color:var(--chalk);font-weight:500}
+  .diag.bad{border-color:var(--mirchi-dim)}
+  .diag.bad b{color:var(--mirchi)}
   .toast{position:fixed;left:50%;bottom:calc(var(--navh) + 20px);transform:translate(-50%,14px);background:var(--chalk);color:var(--ink);padding:10px 18px;border-radius:11px;font-size:13.5px;font-weight:500;z-index:60;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;max-width:88vw;text-align:center}
   .toast.show{opacity:1;transform:translate(-50%,0)}
   .empty{text-align:center;padding:38px 16px;color:var(--muted);font-size:14px}
@@ -274,11 +279,6 @@
       <div style="margin-top:14px" id="monthStats"></div>
     </div>
 
-    <div class="syncbar">
-      <span class="dot" id="syncDot"></span>
-      <span id="syncText">Saved on this device</span>
-      <button id="syncNow">Sync</button>
-    </div>
   </section>
 
   <!-- TAB 2 · HABITS -->
@@ -303,6 +303,12 @@
       <div id="mealList"></div>
     </div>
   </section>
+
+  <div class="syncbar">
+    <span class="dot" id="syncDot"></span>
+    <span id="syncText">Saved on this device</span>
+    <button id="syncNow">Sync</button>
+  </div>
 </div>
 
 <nav class="tabbar" role="tablist">
@@ -350,6 +356,11 @@
       <button class="btn" id="testConn">Test connection</button>
       <button class="btn primary" id="saveUrl">Save and sync</button>
     </div>
+    <div class="diag" id="diag"></div>
+    <div class="row">
+      <button class="btn ghost" id="pushAll">Push everything to Sheet</button>
+    </div>
+    <p class="hint" style="margin-top:8px">Use that if you logged things before the Sheet was connected — it re-sends every habit tick and meal you have on this device.</p>
 
     <h3>Your data</h3>
     <div class="row">
@@ -570,7 +581,8 @@ var META={
 };
 var MEALS=["Breakfast","Lunch","Snacks","Dinner"];
 
-var state={categories:[],marks:{},queue:[],meals:{},mealQueue:[],foods:[],targets:{},scriptUrl:""};
+var state={categories:[],marks:{},queue:[],meals:{},mealQueue:[],foods:[],targets:{},scriptUrl:"",
+  catDirty:false,foodsDirty:false};
 var viewDate=todayKey();
 var activeTab="summary";
 var syncing=false;
@@ -597,10 +609,11 @@ function load(){
     state.categories=p.categories||[]; state.marks=p.marks||{}; state.queue=p.queue||[];
     state.meals=p.meals||{}; state.mealQueue=p.mealQueue||[]; state.foods=p.foods||[];
     state.targets=p.targets||{};
+    state.catDirty=!!p.catDirty; state.foodsDirty=!!p.foodsDirty;
     // honour a saved URL even when blank — that means "go local-only"
     if(Object.prototype.hasOwnProperty.call(p,"scriptUrl")){ state.scriptUrl=p.scriptUrl||""; seen=true; }
   }catch(e){} }
-  if(!seen) state.scriptUrl=DEFAULT_SCRIPT_URL;
+  if(!seen){ state.scriptUrl=DEFAULT_SCRIPT_URL; state.catDirty=true; }
   if(!state.categories.length) state.categories=DEFAULT_CATS.slice();
   N.forEach(function(k){ if(state.targets[k]==null) state.targets[k]=DEFAULT_TARGETS[k]; });
 }
@@ -1056,13 +1069,17 @@ function closeFoodPanel(){
 }
 
 /* ── sync ── */
-var syncTimer=null;
+var syncTimer=null, lastError="", warnedOnce=false;
 function queueSync(){
   if(!state.scriptUrl) return;
   clearTimeout(syncTimer);
   syncTimer=setTimeout(function(){ sync(false); },1200);
 }
-function setSync(cls,text){ $("#syncDot").className="dot "+cls; $("#syncText").textContent=text; }
+function setSync(cls,text){
+  $("#syncDot").className="dot "+cls;
+  $("#syncText").textContent=text;
+  if(cls!=="err") lastError="";
+}
 function sync(loud){
   if(!state.scriptUrl){
     if(loud) toast("Add your Google Sheet link in settings first");
@@ -1072,11 +1089,20 @@ function sync(loud){
   if(syncing) return Promise.resolve();
   syncing=true; setSync("busy","Syncing…");
   var bm=state.queue.slice(), be=state.mealQueue.slice();
+  var pushCats=state.catDirty, pushFoods=state.foodsDirty;
   return fetch(state.scriptUrl,{
     method:"POST",headers:{"Content-Type":"text/plain;charset=utf-8"},
-    body:JSON.stringify({action:"sync",marks:bm,entries:be,categories:state.categories,foods:state.foods})
+    body:JSON.stringify({
+      action:"sync", marks:bm, entries:be,
+      // Only sent when this device actually changed them, so a second device
+      // can't clobber the Sheet with the defaults it booted with.
+      categories: pushCats ? state.categories : [],
+      foods: pushFoods ? state.foods : []
+    })
   }).then(function(r){ return r.json(); }).then(function(res){
-    if(!res||!res.ok) throw new Error(res&&res.error||"Sheet said no");
+    if(!res||!res.ok) throw new Error(res&&res.error||"the Sheet rejected the request");
+    if(pushCats) state.catDirty=false;
+    if(pushFoods) state.foodsDirty=false;
     if(res.categories&&res.categories.length) state.categories=res.categories;
     if(res.marks) state.marks=res.marks;
     if(res.meals) state.meals=res.meals;
@@ -1088,12 +1114,17 @@ function sync(loud){
       return !be.some(function(b){ return b.id===q.id&&b.updatedAt===q.updatedAt; });
     });
     save(); renderAll();
+    warnedOnce=false;
     setSync("ok","Synced "+new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}));
     if(loud) toast("Synced to your sheet");
   }).catch(function(err){
-    setSync("err","Offline — "+(state.queue.length+state.mealQueue.length)+" waiting");
-    if(loud) toast("Couldn't reach the sheet. Check the URL and deployment access.");
-    console.error(err);
+    var msg=String(err&&err.message||err);
+    lastError=msg;
+    setSync("err","Not synced — tap for why");
+    // A silent failure is worse than a loud one: say it out loud the first
+    // time it happens in a session, not only when the user pressed Sync.
+    if(loud||!warnedOnce){ warnedOnce=true; toast(msg.slice(0,150)); }
+    console.error("Khata sync failed:",err);
   }).then(function(){ syncing=false; });
 }
 
@@ -1204,7 +1235,8 @@ $("#addCat").addEventListener("click",function(){
 $("#saveCats").addEventListener("click",function(){
   var clean=draftCats.filter(function(c){ return c.name.trim(); });
   clean.forEach(function(c){ c.name=c.name.trim(); c.emoji=(c.emoji||"•").trim(); });
-  state.categories=clean; save(); renderAll(); toast("Categories saved"); sync(false);
+  state.categories=clean; state.catDirty=true; save(); renderAll();
+  toast("Categories saved"); sync(false);
 });
 $("#saveTargets").addEventListener("click",function(){
   $("#targetGrid").querySelectorAll("input").forEach(function(inp){
@@ -1217,19 +1249,64 @@ $("#saveUrl").addEventListener("click",function(){
   state.scriptUrl=$("#scriptUrl").value.trim(); save();
   sync(true).then(closePanel);
 });
+function showDiag(html,bad){
+  var d=$("#diag");
+  d.className="diag on"+(bad?" bad":"");
+  d.innerHTML=html;
+}
 $("#testConn").addEventListener("click",function(){
   var url=$("#scriptUrl").value.trim();
   if(!url) return toast("Paste the web app URL first");
-  setSync("busy","Testing…");
+  setSync("busy","Testing…"); showDiag("Testing…");
   fetch(url+(url.indexOf("?")>-1?"&":"?")+"action=ping")
     .then(function(r){ return r.json(); })
     .then(function(res){
-      if(res&&res.ok){ setSync("ok","Connection works"); toast('Connected to "'+(res.sheet||"your sheet")+'"'); }
-      else throw new Error("bad");
+      if(!res) throw new Error("empty response");
+      if(!res.ok) throw new Error(res.error||"the script returned an error");
+      var tabs=(res.tabs||[]).map(function(t){ return "  "+t.name+" — "+t.rows+" rows"; }).join("\n");
+      setSync("ok","Connection works");
+      showDiag('<b>Connected to "'+esc(res.sheet||"your sheet")+'"</b>\n'+esc(tabs||"  (no tabs reported)"),false);
     })
-    .catch(function(){ setSync("err","Connection failed"); toast("No response. Redeploy with access set to Anyone."); });
+    .catch(function(err){
+      setSync("err","Connection failed");
+      showDiag('<b>Failed</b>\n'+esc(String(err&&err.message||err))+
+        '\n\nUsual causes:\n  1. SHEET_ID not set in Code.gs\n'+
+        '  2. Deployment access is not "Anyone"\n'+
+        '  3. Code.gs edited but no new version deployed',true);
+    });
+});
+
+$("#pushAll").addEventListener("click",function(){
+  if(!state.scriptUrl) return toast("Set the Sheet URL first");
+  // Rebuild both queues from everything held locally.
+  state.queue=[];
+  Object.keys(state.marks).forEach(function(d){
+    Object.keys(state.marks[d]).forEach(function(cid){
+      var c=state.categories.filter(function(x){return x.id===cid;})[0]||{};
+      var m=state.marks[d][cid];
+      state.queue.push({date:d,categoryId:cid,categoryName:c.name||"",kind:c.kind||"",
+        status:m.status,note:m.note||"",updatedAt:new Date().toISOString()});
+    });
+  });
+  state.mealQueue=[];
+  Object.keys(state.meals).forEach(function(d){
+    (state.meals[d]||[]).forEach(function(e){ queueMeal("put",d,e); });
+  });
+  state.catDirty=true; state.foodsDirty=state.foods.length>0;
+  save();
+  var n=state.queue.length+state.mealQueue.length;
+  showDiag("Queued <b>"+n+"</b> records. Sending…");
+  sync(true).then(function(){
+    var left=state.queue.length+state.mealQueue.length;
+    if(left) showDiag("<b>"+left+"</b> records still waiting — see the error above.",true);
+    else showDiag("<b>Done.</b> Everything on this device is now in the Sheet.",false);
+  });
 });
 $("#syncNow").addEventListener("click",function(){ sync(true); });
+$("#syncText").addEventListener("click",function(){
+  if(lastError){ openPanel(); showDiag('<b>Last sync error</b>\n'+esc(lastError),true); }
+});
+$("#syncText").style.cursor="pointer";
 $("#exportCsv").addEventListener("click",exportCsv);
 
 $("#addFood").addEventListener("click",openFoodPicker);
@@ -1252,7 +1329,7 @@ $("#mfSave").addEventListener("click",function(){
     var v=parseFloat(inp.value); per[inp.dataset.k]=isFinite(v)?v:0;
   });
   var food={id:"m"+Date.now().toString(36),src:"mine",name:name,unit:"serving",g:100,per100:per,tags:name.toLowerCase()};
-  state.foods.push(food); save(); sync(false); openAddFood(food);
+  state.foods.push(food); state.foodsDirty=true; save(); sync(false); openAddFood(food);
 });
 $("#faBack").addEventListener("click",function(){ showFoodView("search"); });
 $("#qMinus").addEventListener("click",function(){
